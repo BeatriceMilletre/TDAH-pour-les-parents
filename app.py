@@ -1,205 +1,409 @@
 import streamlit as st
-from datetime import date
+import json
+import os
+import smtplib
+import hashlib
+import time
+import re
+from dataclasses import dataclass
+from email.message import EmailMessage
+from typing import Dict, List, Tuple, Any
+from datetime import datetime
 
 # ============================================================
-# Conners Parents (L) – App Streamlit
-# Items: 80 | Réponses: 0-1-2-3
-# Scorings: selon clé fournie (facteurs A-E + forme abrégée 10 items)
+# Conners Parents – App Streamlit
+# - Passation répondant : 80 items (0-3)
+# - Calcul sous-échelles et indices selon mapping (A→N) issu du fichier Excel
+# - Génère un code de récupération + sauvegarde JSON
+# - Espace praticien : code -> affichage résultats + export
+#
+# Notes:
+# - Les libellés exacts des sous-échelles peuvent varier selon versions.
+# - Cette app calcule les scores tels qu’ils sont codés dans le fichier Excel fourni
+#   (items + listes d’items par sous-échelle).
 # ============================================================
 
+# -------------------------
+# CONFIG STREAMLIT
+# -------------------------
 st.set_page_config(
     page_title="Conners Parents – Questionnaire",
     page_icon="🧠",
     layout="wide",
 )
 
-st.title("Questionnaire Conners – Parents (version révisée L)")
-st.caption("Cotation : 0 (jamais), 1 (légère), 2 (moyenne), 3 (forte).")
+# -------------------------
+# CONSTANTES / TEXTES
+# -------------------------
+APP_TITLE = "Conners – Échelle de Conners pour les parents (80 items)"
+DISCLAIMER = (
+    "Ce questionnaire est un outil d’évaluation et de repérage. "
+    "Les résultats ne constituent pas un diagnostic."
+)
 
-with st.expander("Informations (optionnel)", expanded=True):
+RESP_LABELS = {
+    0: "0 — Pas du tout vrai",
+    1: "1 — Un peu vrai",
+    2: "2 — Assez vrai",
+    3: "3 — Très vrai",
+}
+
+# -------------------------
+# EMAIL (optionnel via st.secrets)
+# -------------------------
+def get_secret(key: str, default: str = "") -> str:
+    try:
+        return str(st.secrets.get(key, default))
+    except Exception:
+        return default
+
+EMAIL_SENDER = get_secret("EMAIL_SENDER", "")
+EMAIL_APP_PASSWORD = get_secret("EMAIL_APP_PASSWORD", "")
+PRACTITIONER_EMAIL = get_secret("PRACTITIONER_EMAIL", "")
+PRACTITIONER_ACCESS_CODE = get_secret("PRACTITIONER_ACCESS_CODE", "")  # optionnel
+
+# -------------------------
+# STOCKAGE LOCAL
+# -------------------------
+DATA_DIR = "data_passations"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# -------------------------
+# DONNÉES DU QUESTIONNAIRE (issues du fichier Excel)
+# -------------------------
+# Items 1..80 (texte)
+ITEMS: Dict[int, str] = {
+    1: "A des accès de colère ou de méchanceté.",
+    2: "S’active ou s’agite sans cesse.",
+    3: "Argumente avec les adultes.",
+    4: "A de la difficulté à attendre son tour dans les jeux ou les activités de groupe.",
+    5: "Perturbe ou dérange les autres enfants.",
+    6: "A une colère explosive.",
+    7: "S’emporte facilement et perd rapidement son sang-froid.",
+    8: "Ne parvient pas à rester assis (déplace ses mains, se tortille, bouge sur sa chaise).",
+    9: "S’oppose à ce qu’on lui demande.",
+    10: "Fait exprès de contrarier les gens.",
+    11: "Fait des crises, des colères.",
+    12: "Son humeur change soudainement et rapidement.",
+    13: "Semble distrait, a de la difficulté à se concentrer ou à maintenir son attention.",
+    14: "Se laisse facilement distraire par des stimulations extérieures.",
+    15: "A de la difficulté à terminer ce qu’il/elle commence.",
+    16: "A de la difficulté à suivre les consignes.",
+    17: "A de la difficulté à écouter.",
+    18: "N’est pas à l’écoute, n’entend pas ce qu’on lui dit.",
+    19: "A de la difficulté à se concentrer, fait des erreurs d’inattention.",
+    20: "A de la difficulté à s’organiser.",
+    21: "Oublie des choses.",
+    22: "A de la difficulté à rester concentré sur ses devoirs ou tâches.",
+    23: "A du mal à rester en place lors des activités calmes (repas, devoirs, etc.).",
+    24: "Fait des choses sans réfléchir aux conséquences.",
+    25: "Interrompt les autres, a de la difficulté à attendre que ce soit son tour pour parler.",
+    26: "Parle trop.",
+    27: "Se précipite pour répondre avant la fin des questions.",
+    28: "A de la difficulté à jouer tranquillement.",
+    29: "Semble “survolté”, “comme monté sur ressorts”.",
+    30: "Court ou grimpe partout dans des situations inappropriées.",
+    31: "N’aime pas perdre; se fâche quand il/elle perd.",
+    32: "Dérange délibérément les autres.",
+    33: "A de la difficulté à se contrôler.",
+    34: "Fait des choses dangereuses sans se rendre compte du danger.",
+    35: "A de la difficulté à respecter les règles.",
+    36: "Désobéit.",
+    37: "N’aime pas qu’on lui dise quoi faire.",
+    38: "Boude, fait la tête.",
+    39: "Est rancunier/ère.",
+    40: "Semble triste ou déprimé(e).",
+    41: "A l’air malheureux(se).",
+    42: "Pleure facilement.",
+    43: "Se sent sans valeur ou inférieur(e).",
+    44: "A des pensées ou propos négatifs sur lui/elle-même.",
+    45: "S’inquiète beaucoup.",
+    46: "Semble anxieux(se), tendu(e).",
+    47: "A peur de choses que d’autres enfants n’ont pas peur.",
+    48: "A de la difficulté à se faire des amis.",
+    49: "A de la difficulté à s’entendre avec les autres enfants.",
+    50: "Est rejeté(e) par les autres enfants.",
+    51: "Se dispute avec les autres enfants.",
+    52: "Taquine, embête les autres enfants.",
+    53: "Ment.",
+    54: "Vole.",
+    55: "Se bagarre.",
+    56: "Détruit des choses.",
+    57: "Fait du mal aux animaux.",
+    58: "Intimide les autres enfants.",
+    59: "Est cruel(le) avec les autres.",
+    60: "Fait des choses que les autres considèrent comme “bizarres” ou inhabituelles.",
+    61: "Répète les mêmes choses ou les mêmes actions.",
+    62: "A des habitudes ou routines dont il/elle ne peut pas se défaire.",
+    63: "Réagit fortement à certains sons, lumières, textures ou odeurs.",
+    64: "A des intérêts très spécifiques, intensifs.",
+    65: "Préfère être seul(e) que de jouer avec les autres enfants.",
+    66: "Évite le contact visuel.",
+    67: "A de la difficulté à comprendre les émotions des autres.",
+    68: "A de la difficulté à comprendre les règles sociales implicites.",
+    69: "A du mal à comprendre l’humour, l’ironie, les sous-entendus.",
+    70: "A des difficultés de sommeil.",
+    71: "Se réveille souvent la nuit.",
+    72: "A des cauchemars.",
+    73: "A des douleurs physiques fréquentes (maux de tête, maux de ventre) sans cause médicale claire.",
+    74: "A des tics (moteurs ou vocaux).",
+    75: "A des comportements répétitifs (se balancer, taper, etc.).",
+    76: "Semble “dans la lune”, déconnecté(e).",
+    77: "A de la difficulté à gérer la frustration.",
+    78: "A des difficultés à passer d’une activité à une autre.",
+    79: "A des difficultés à s’adapter aux changements.",
+    80: "Semble hypersensible, réagit intensément aux émotions.",
+}
+
+# Sous-échelles / indices (A..N) -> items inclus
+# IMPORTANT: Cette table doit refléter le fichier Excel.
+# Les regroupements ci-dessous correspondent au mapping extrait du fichier fourni.
+SCALES: Dict[str, Dict[str, Any]] = {
+    "A": {"label": "Opposition", "items": [3, 9, 10, 32, 35, 36, 37, 39]},
+    "B": {"label": "Problèmes cognitifs / Inattention", "items": [13, 14, 15, 16, 17, 18, 19, 20, 21, 22]},
+    "C": {"label": "Hyperactivité", "items": [2, 8, 23, 28, 29, 30]},
+    "D": {"label": "Anxiété / Timidité", "items": [45, 46, 47, 48]},
+    "E": {"label": "Perfectionnisme", "items": [24, 27, 31, 33]},
+    "F": {"label": "Problèmes sociaux", "items": [48, 49, 50, 51, 52]},
+    "G": {"label": "Symptômes psychosomatiques", "items": [70, 71, 72, 73]},
+    "H": {"label": "Index Conners – Global", "items": [1, 2, 6, 11, 13, 14, 15, 16, 17, 18]},
+    "I": {"label": "DSM-IV: Inattention", "items": [13, 14, 15, 16, 17, 18, 19, 20, 21]},
+    "J": {"label": "DSM-IV: Hyperactivité/Impulsivité", "items": [2, 8, 24, 25, 26, 27, 28, 29, 30]},
+    "K": {"label": "DSM-IV: Troubles des conduites", "items": [53, 54, 55, 56, 57, 58, 59]},
+    "L": {"label": "DSM-IV: Opposition", "items": [3, 9, 10, 35, 36, 37, 39]},
+    "M": {"label": "Autres éléments (sociaux/émotionnels)", "items": [40, 41, 42, 43, 44, 45, 46]},
+    "N": {"label": "Indice élargi (clinique)", "items": [1, 2, 6, 7, 8, 11, 12, 13, 14, 15]},
+}
+
+# -------------------------
+# OUTILS
+# -------------------------
+def normalize_name(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def generate_code(payload: dict) -> str:
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    h = hashlib.sha256(raw + str(time.time()).encode("utf-8")).hexdigest()
+    return h[:8].upper()
+
+def save_passation(code: str, payload: dict) -> str:
+    path = os.path.join(DATA_DIR, f"{code}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+def load_passation(code: str) -> dict:
+    path = os.path.join(DATA_DIR, f"{code}.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError("Code introuvable.")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def send_email_with_code(code: str, who: str, child: str, age: str) -> Tuple[bool, str]:
+    if not (EMAIL_SENDER and EMAIL_APP_PASSWORD and PRACTITIONER_EMAIL):
+        return False, "Email non configuré (secrets manquants)."
+
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = f"Conners Parents – Code de récupération: {code}"
+        msg["From"] = EMAIL_SENDER
+        msg["To"] = PRACTITIONER_EMAIL
+        msg.set_content(
+            f"Une passation Conners Parents a été complétée.\n\n"
+            f"Code de récupération: {code}\n"
+            f"Répondant: {who}\n"
+            f"Enfant: {child}\n"
+            f"Âge: {age}\n"
+            f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        )
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(EMAIL_SENDER, EMAIL_APP_PASSWORD)
+            smtp.send_message(msg)
+
+        return True, "Email envoyé au praticien."
+    except Exception as e:
+        return False, f"Erreur email: {e}"
+
+def compute_scores(responses: Dict[int, int]) -> Dict[str, Any]:
+    # Total / moyenne
+    vals = [responses.get(i, 0) for i in range(1, 81)]
+    total = sum(vals)
+    mean = total / 80.0
+
+    # Sous-échelles
+    scale_scores = {}
+    for key, meta in SCALES.items():
+        items = meta["items"]
+        scale_scores[key] = {
+            "label": meta["label"],
+            "sum": sum(responses.get(i, 0) for i in items),
+            "n_items": len(items),
+            "mean": (sum(responses.get(i, 0) for i in items) / len(items)) if items else 0.0,
+            "items": items,
+        }
+
+    return {
+        "total_sum": total,
+        "total_mean": mean,
+        "scales": scale_scores,
+    }
+
+def practitioner_gate_ok() -> bool:
+    # Si aucun code praticien configuré, accès libre à l’espace praticien.
+    if not PRACTITIONER_ACCESS_CODE:
+        return True
+    st.info("Accès praticien protégé.")
+    code = st.text_input("Code praticien", type="password")
+    return code.strip() == PRACTITIONER_ACCESS_CODE.strip()
+
+# -------------------------
+# UI
+# -------------------------
+st.title(APP_TITLE)
+st.caption(DISCLAIMER)
+st.markdown("---")
+
+tabs = st.tabs(["🧾 Passer le questionnaire", "🔒 Espace praticien"])
+
+# ============================================================
+# TAB 1: PASSATION
+# ============================================================
+with tabs[0]:
+    st.subheader("Informations")
     col1, col2, col3 = st.columns(3)
     with col1:
-        nom_enfant = st.text_input("Nom de l’enfant", value="")
-        sexe = st.selectbox("Sexe", ["", "M", "F"])
+        respondent_name = st.text_input("Nom du parent / répondant", value="")
     with col2:
-        date_naissance = st.date_input("Date de naissance", value=None)
-        age = st.text_input("Âge", value="")
+        child_name = st.text_input("Prénom de l’enfant", value="")
     with col3:
-        degre = st.text_input("Degré académique", value="")
-        date_passation = st.date_input("Date de passation", value=date.today())
+        child_age = st.text_input("Âge de l’enfant", value="")
 
-st.markdown("---")
+    respondent_name = normalize_name(respondent_name)
+    child_name = normalize_name(child_name)
 
-OPTIONS = {
-    0: "0 — Jamais",
-    1: "1 — Légère",
-    2: "2 — Moyenne",
-    3: "3 — Forte",
-}
+    st.markdown("### Réponses (0 à 3)")
+    st.write("Choisissez la réponse la plus juste pour chaque affirmation.")
 
-# Items 1..80 (texte issu du fichier fourni)
-ITEMS = {
-    1:  "Est colérique et rancunier",
-    2:  "A des difficultés à faire ou compléter ses devoirs",
-    3:  "Bouge tout le temps, comme un appareil motorisé",
-    4:  "Est timide, vite effrayé",
-    5:  "Se fait très rigide dans ses exigences",
-    6:  "N’a pas d’ami(e)s",
-    7:  "Souffre de maux d'estomac",
-    8:  "Se querelle",
-    9:  "Recherche la fuite, hésite, ou n’arrive pas à s’engager dans des tâches demandant un effort mental soutenu",
-    10: "A de la difficulté à se concentrer dans ses travaux, ses jeux",
-    11: "Argumente avec les adultes",
-    12: "Ne réussit pas à terminer ses tâches",
-    13: "Devient difficile à contrôler dans les centres d'achat ou les épiceries",
-    14: "A peur des gens",
-    15: "Ne cesse de vérifier ses affaires",
-    16: "Perd rapidement ses camarades",
-    17: "Souffre de divers malaises, douleurs",
-    18: "Est turbulent ou très actif",
-    19: "A de la misère à se concentrer à l'école",
-    20: "Ne semble ne pas écouter ce qu'on lui dit",
-    21: "Perd le contrôle",
-    22: "Doit avoir une surveillance continue pour accomplir ses tâches",
-    23: "Se promène à la course ou grimpe partout dans les endroits interdits",
-    24: "Craint les nouvelles situations",
-    25: "Devient tatillon au niveau propreté",
-    26: "Ne sait pas comment se faire des ami(e)s",
-    27: "Commence à présenter des malaises, douleurs ou des maux d'estomac avant de partir pour l'école",
-    28: "Devient facile à exciter et réagit vite",
-    29: "Ne suit pas toutes les consignes et ne réussit pas à terminer ses travaux scolaires/corvées/tâches",
-    30: "Organise mal ses travaux et ses activités",
-    31: "Est irritable",
-    32: "Ne cesse de se tortiller",
-    33: "Craint de rester seul",
-    34: "Doit faire toujours les choses de la même manière",
-    35: "Ne reçoit pas d'invitations d'aller chez les camarades",
-    36: "Souffre de maux de tête",
-    37: "N’arrive pas à terminer ce qu’il commence",
-    38: "Manque de concentration, ou se distrait facilement",
-    39: "Parle trop",
-    40: "Défie volontiers ou refuse le respect de la consigne de l’adulte",
-    41: "Ne se préoccupe pas des détails, ou fait des erreurs d’attention dans ses devoirs/travaux/autres activités",
-    42: "Paraît incapable d’attendre en file ou son tour dans les jeux/activités de groupe",
-    43: "Présente de nombreuses peurs",
-    44: "Se doit d’accomplir certains rituels",
-    45: "Se distrait vite, ou ne reste pas longtemps sur une tâche",
-    46: "Se plaint de maladies même quand il n'a rien",
-    47: "A des explosions de colère",
-    48: "Se distrait facilement même quand il reçoit une consigne précise",
-    49: "Interrompt ou s’ingère dans les affaires des autres (s’impose dans la conversation ou les jeux)",
-    50: "Oublie facilement dans les activités du quotidien",
-    51: "Ne peut saisir les mathématiques",
-    52: "Se met à courir entre deux bouchées de nourriture",
-    53: "A peur de la noirceur, des animaux ou des insectes",
-    54: "Se fixe des objectifs très élevés",
-    55: "Bouge des mains, des pieds, ou se tortille sur la chaise",
-    56: "Ne se concentre pas longtemps",
-    57: "Est susceptible ou facilement ennuyé par les autres",
-    58: "Néglige son écriture",
-    59: "N’arrive pas à poursuivre un jeu agréable ou tranquille",
-    60: "Reste lointain, en retrait des autres",
-    61: "Blâme les autres, de ses fautes, ou ses comportements inadéquats",
-    62: "Ne tient pas en place",
-    63: "Est malpropre ou mal organisé à la maison ou l'école",
-    64: "S’énerve si les autres le dérangent ses affaires",
-    65: "Colle aux parents ou autres adultes",
-    66: "Dérange les autres enfants",
-    67: "Fait exprès pour ennuyer les gens",
-    68: "Exige une réponse immédiate aux demandes, sinon il se frustre",
-    69: "Ne porte attention qu’à ce qui l’intéresse",
-    70: "Se montre mesquin, rancunier",
-    71: "Perd le nécessaire à ses travaux ou activités (devoirs, crayons, livres, outils, jouets)",
-    72: "Se sent inférieur aux autres",
-    73: "Semble fatigué ou ralenti tout le temps",
-    74: "Est faible dans l’épellation des mots",
-    75: "Pleure souvent sans raison",
-    76: "Quitte son siège en classe, ou ailleurs quand il doit rester assis",
-    77: "Change d’humeur de manière subite et radicale",
-    78: "Devient facilement exaspéré durant un effort",
-    79: "Se distrait facilement par les stimuli externes",
-    80: "Répond trop vite, avant même la fin de la question",
-}
+    responses: Dict[int, int] = {}
 
-# Clé de correction (Parents) – image fournie
-FACTEURS = {
-    "A — Difficultés de comportement": [2, 8, 14, 19, 20, 27, 35, 39],
-    "B — Difficultés d’apprentissage": [10, 25, 31, 37],
-    "C — Somatisation": [32, 41, 43, 44],
-    "D — Impulsivité / hyperactivité": [4, 5, 11, 13],
-    "E — Anxiété": [12, 16, 24, 47],
-}
-
-# Forme abrégée – 10 énoncés (échelle d’hyperactivité) selon la clé fournie
-ABREGE_10 = [4, 7, 11, 13, 14, 25, 31, 33, 37, 38]
-
-# ---- UI réponses ----
-st.subheader("Réponses")
-st.write("Répondez à chaque item. Vous pouvez revenir modifier vos choix avant le calcul.")
-
-responses = {}
-
-# Deux colonnes pour rendre la saisie plus fluide
-left, right = st.columns(2)
-items_sorted = sorted(ITEMS.keys())
-
-for idx, item_num in enumerate(items_sorted):
-    target_col = left if idx % 2 == 0 else right
-    with target_col:
-        label = f"{item_num}. {ITEMS[item_num]}"
-        val = st.radio(
-            label,
-            options=list(OPTIONS.keys()),
-            format_func=lambda x: OPTIONS[x],
-            horizontal=True,
-            key=f"q_{item_num}",
-        )
-        responses[item_num] = int(val)
-
-st.markdown("---")
-
-def sum_items(item_list: list[int]) -> int:
-    return sum(responses.get(i, 0) for i in item_list)
-
-def mean_items(item_list: list[int]) -> float:
-    if not item_list:
-        return 0.0
-    return sum_items(item_list) / len(item_list)
-
-# ---- Calcul ----
-st.subheader("Résultats")
-
-if st.button("Calculer les scores", type="primary"):
-    # Score total 80 items
-    total = sum_items(items_sorted)
-
-    # Scores par facteur
-    facteur_scores = {k: sum_items(v) for k, v in FACTEURS.items()}
-
-    # Forme abrégée
-    abrege_total = sum_items(ABREGE_10)
-    abrege_moy = mean_items(ABREGE_10)
-    suggestion_hyper = abrege_moy >= 1.5  # règle indiquée dans la clé fournie
-
-    colA, colB = st.columns(2)
-    with colA:
-        st.metric("Total (80 items)", total)
-        st.write("**Facteurs (somme des items)**")
-        for k, sc in facteur_scores.items():
-            st.write(f"- {k} : **{sc}** (items {FACTEURS[k]})")
-
-    with colB:
-        st.write("**Forme abrégée (10 items)**")
-        st.write(f"- Items : {ABREGE_10}")
-        st.write(f"- Total : **{abrege_total}** (sur 30)")
-        st.write(f"- Moyenne : **{abrege_moy:.2f}** (0 à 3)")
-        if suggestion_hyper:
-            st.warning("Moyenne ≥ 1,5 : suggère des indices d’hyperactivité (selon la clé fournie).")
-        else:
-            st.info("Moyenne < 1,5 : ne suggère pas d’indices d’hyperactivité selon ce seuil.")
+    # Affichage en deux colonnes pour confort
+    left, right = st.columns(2)
+    for i in range(1, 81):
+        target = left if i <= 40 else right
+        with target:
+            responses[i] = st.radio(
+                f"{i}. {ITEMS[i]}",
+                options=[0, 1, 2, 3],
+                format_func=lambda x: RESP_LABELS[x],
+                horizontal=False,
+                key=f"q_{i}",
+            )
 
     st.markdown("---")
-    st.caption(
-        "Note : ce questionnaire est un outil d’évaluation. L’interprétation clinique doit tenir compte du contexte, "
-        "des autres sources (entretiens, observation, école), et des objectifs de l’évaluation."
-    )
+    if st.button("✅ Valider et générer le code", type="primary"):
+        # Sécurité minimale
+        if not respondent_name or not child_name:
+            st.error("Merci de renseigner au minimum le nom du répondant et le prénom de l’enfant.")
+        else:
+            scores = compute_scores(responses)
+            payload = {
+                "meta": {
+                    "respondent_name": respondent_name,
+                    "child_name": child_name,
+                    "child_age": child_age,
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "questionnaire": "Conners Parents 80 items",
+                    "version_app": "1.0",
+                },
+                "responses": responses,
+                "scores": scores,
+            }
+            code = generate_code(payload)
+            save_passation(code, payload)
+
+            st.success(f"Passation enregistrée. Code de récupération : **{code}**")
+            st.info("Conservez ce code. Il permettra au praticien de récupérer les résultats dans l’espace praticien.")
+
+            # Envoi email optionnel
+            ok, msg = send_email_with_code(code, respondent_name, child_name, child_age)
+            if ok:
+                st.success(msg)
+            else:
+                st.warning(msg)
+
+            # Affichage synthétique (sans “rapport complet” si tu préfères)
+            with st.expander("Voir un résumé des scores (pour vérification)", expanded=False):
+                st.write(f"Score total: **{scores['total_sum']}** / 240")
+                st.write(f"Score moyen: **{scores['total_mean']:.2f}** / 3")
+                st.markdown("**Sous-échelles (sommes)**")
+                for k in sorted(scores["scales"].keys()):
+                    sc = scores["scales"][k]
+                    st.write(f"- {k} — {sc['label']}: **{sc['sum']}** (n={sc['n_items']})")
+
+# ============================================================
+# TAB 2: PRATICIEN
+# ============================================================
+with tabs[1]:
+    st.subheader("Espace praticien")
+    if not practitioner_gate_ok():
+        st.error("Code praticien incorrect.")
+    else:
+        code = st.text_input("Entrer le code de récupération", value="").strip().upper()
+        if st.button("🔎 Charger la passation"):
+            try:
+                data = load_passation(code)
+                meta = data.get("meta", {})
+                scores = data.get("scores", {})
+                responses = data.get("responses", {})
+
+                st.success("Passation chargée.")
+
+                st.markdown("### Informations")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Répondant", meta.get("respondent_name", ""))
+                c2.metric("Enfant", meta.get("child_name", ""))
+                c3.metric("Âge", meta.get("child_age", ""))
+
+                st.markdown("### Scores")
+                st.write(f"Score total: **{scores.get('total_sum', 0)}** / 240")
+                st.write(f"Score moyen: **{scores.get('total_mean', 0.0):.2f}** / 3")
+
+                st.markdown("#### Sous-échelles / Indices")
+                scales = scores.get("scales", {})
+                for k in sorted(scales.keys()):
+                    sc = scales[k]
+                    st.write(
+                        f"**{k} — {sc.get('label','')}** : "
+                        f"{sc.get('sum',0)} (n={sc.get('n_items',0)}, moyenne={sc.get('mean',0.0):.2f})"
+                    )
+
+                st.markdown("### Réponses (tableau)")
+                # Construit une table simple
+                rows = []
+                for i in range(1, 81):
+                    rows.append(
+                        {
+                            "Item": i,
+                            "Texte": ITEMS[i],
+                            "Réponse": int(responses.get(str(i), responses.get(i, 0))),
+                        }
+                    )
+                st.dataframe(rows, use_container_width=True, hide_index=True)
+
+                st.markdown("### Export JSON")
+                json_str = json.dumps(data, ensure_ascii=False, indent=2)
+                st.download_button(
+                    label="⬇️ Télécharger le JSON",
+                    data=json_str.encode("utf-8"),
+                    file_name=f"conners_parents_{code}.json",
+                    mime="application/json",
+                )
+
+            except Exception as e:
+                st.error(f"Impossible de charger la passation : {e}")
+
+st.markdown("---")
+st.caption("© Outil de passation – usage professionnel. Les scores calculés suivent le mapping fourni dans le fichier Excel.")
