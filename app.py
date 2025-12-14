@@ -5,37 +5,49 @@ import smtplib
 import hashlib
 import time
 import re
-from dataclasses import dataclass
 from email.message import EmailMessage
-from typing import Dict, List, Tuple, Any
+from typing import Dict, Any, Tuple
 from datetime import datetime
 
 # ============================================================
-# Conners Parents – App Streamlit
+# Streamlit App
+# "Evaluation des signes d'appel du TDAH par les parents"
 # - Passation répondant : 80 items (0-3)
-# - Calcul sous-échelles et indices selon mapping (A→N) issu du fichier Excel
+# - Calcul sous-échelles / indices selon mapping (A→N)
 # - Génère un code de récupération + sauvegarde JSON
 # - Espace praticien : code -> affichage résultats + export
 #
-# Notes:
-# - Les libellés exacts des sous-échelles peuvent varier selon versions.
-# - Cette app calcule les scores tels qu’ils sont codés dans le fichier Excel fourni
-#   (items + listes d’items par sous-échelle).
+# Email: lit la configuration dans st.secrets["email"] comme tes autres apps
+# secrets.toml:
+# [email]
+# host="smtp.gmail.com"
+# port=587
+# username="beatricemilletre@gmail.com"
+# password="xxxx xxxx xxxx xxxx"
+# use_tls=true
+#
+# Optionnel:
+# PRACTITIONER_EMAIL="beatricemilletre@gmail.com"
+# PRACTITIONER_ACCESS_CODE="TON_CODE_PRATICIEN"
 # ============================================================
 
 # -------------------------
 # CONFIG STREAMLIT
 # -------------------------
 st.set_page_config(
-    page_title="Conners Parents – Questionnaire",
+    page_title="Évaluation TDAH – Parents",
     page_icon="🧠",
     layout="wide",
 )
 
 # -------------------------
-# CONSTANTES / TEXTES
+# TITRES / TEXTES
 # -------------------------
-APP_TITLE = "Conners – Échelle de Conners pour les parents (80 items)"
+APP_TITLE = "Evaluation des signes d'appel du TDAH par les parents"
+INSTRUCTION_ADULTE = (
+    "Si votre enfant est adulte aujourd'hui, répondez sans noter son âge, "
+    "et en notant ce qui était marquant lorsqu'il était enfant."
+)
 DISCLAIMER = (
     "Ce questionnaire est un outil d’évaluation et de repérage. "
     "Les résultats ne constituent pas un diagnostic."
@@ -49,18 +61,23 @@ RESP_LABELS = {
 }
 
 # -------------------------
-# EMAIL (optionnel via st.secrets)
+# EMAIL (via st.secrets[email])
 # -------------------------
-def get_secret(key: str, default: str = "") -> str:
+def get_email_config() -> dict:
     try:
-        return str(st.secrets.get(key, default))
+        return dict(st.secrets.get("email", {}))
     except Exception:
-        return default
+        return {}
 
-EMAIL_SENDER = get_secret("EMAIL_SENDER", "")
-EMAIL_APP_PASSWORD = get_secret("EMAIL_APP_PASSWORD", "")
-PRACTITIONER_EMAIL = get_secret("PRACTITIONER_EMAIL", "")
-PRACTITIONER_ACCESS_CODE = get_secret("PRACTITIONER_ACCESS_CODE", "")  # optionnel
+EMAIL_CFG = get_email_config()
+EMAIL_HOST = EMAIL_CFG.get("host", "")
+EMAIL_PORT = int(EMAIL_CFG.get("port", 0) or 0)
+EMAIL_USERNAME = EMAIL_CFG.get("username", "")
+EMAIL_PASSWORD = EMAIL_CFG.get("password", "")
+EMAIL_USE_TLS = bool(EMAIL_CFG.get("use_tls", True))
+
+PRACTITIONER_EMAIL = str(st.secrets.get("PRACTITIONER_EMAIL", EMAIL_USERNAME))
+PRACTITIONER_ACCESS_CODE = str(st.secrets.get("PRACTITIONER_ACCESS_CODE", ""))
 
 # -------------------------
 # STOCKAGE LOCAL
@@ -69,9 +86,80 @@ DATA_DIR = "data_passations"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # -------------------------
-# DONNÉES DU QUESTIONNAIRE (issues du fichier Excel)
+# OUTILS
 # -------------------------
-# Items 1..80 (texte)
+def normalize_name(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def generate_code(payload: dict) -> str:
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    h = hashlib.sha256(raw + str(time.time()).encode("utf-8")).hexdigest()
+    return h[:8].upper()
+
+def save_passation(code: str, payload: dict) -> str:
+    path = os.path.join(DATA_DIR, f"{code}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+def load_passation(code: str) -> dict:
+    path = os.path.join(DATA_DIR, f"{code}.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError("Code introuvable.")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def send_email_with_code(code: str, who: str, child: str, age: str) -> Tuple[bool, str]:
+    # Vérifie configuration
+    if not (EMAIL_HOST and EMAIL_PORT and EMAIL_USERNAME and EMAIL_PASSWORD and PRACTITIONER_EMAIL):
+        return False, "Email non configuré (secrets manquants)."
+
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = f"Évaluation TDAH – Code de récupération: {code}"
+        msg["From"] = EMAIL_USERNAME
+        msg["To"] = PRACTITIONER_EMAIL
+        msg.set_content(
+            "Une passation 'Évaluation des signes d'appel du TDAH par les parents' a été complétée.\n\n"
+            f"Code de récupération: {code}\n"
+            f"Répondant: {who}\n"
+            f"Enfant: {child}\n"
+            f"Âge (si renseigné): {age}\n"
+            f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        )
+
+        smtp = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=20)
+        try:
+            smtp.ehlo()
+            if EMAIL_USE_TLS:
+                smtp.starttls()
+                smtp.ehlo()
+            smtp.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+            smtp.send_message(msg)
+        finally:
+            try:
+                smtp.quit()
+            except Exception:
+                pass
+
+        return True, "Email envoyé au praticien."
+    except Exception as e:
+        return False, f"Erreur email: {e}"
+
+def practitioner_gate_ok() -> bool:
+    # Si aucun code praticien configuré, accès libre à l’espace praticien.
+    if not PRACTITIONER_ACCESS_CODE.strip():
+        return True
+    st.info("Accès praticien protégé.")
+    code = st.text_input("Code praticien", type="password")
+    return code.strip() == PRACTITIONER_ACCESS_CODE.strip()
+
+# -------------------------
+# DONNÉES DU QUESTIONNAIRE
+# -------------------------
+# Items 1..80 (texte) — tels que présents dans ton fichier (ou une version équivalente)
 ITEMS: Dict[int, str] = {
     1: "A des accès de colère ou de méchanceté.",
     2: "S’active ou s’agite sans cesse.",
@@ -156,8 +244,7 @@ ITEMS: Dict[int, str] = {
 }
 
 # Sous-échelles / indices (A..N) -> items inclus
-# IMPORTANT: Cette table doit refléter le fichier Excel.
-# Les regroupements ci-dessous correspondent au mapping extrait du fichier fourni.
+# (mapping identique à la version précédente — ajustable si tu veux coller strictement à ton Excel)
 SCALES: Dict[str, Dict[str, Any]] = {
     "A": {"label": "Opposition", "items": [3, 9, 10, 32, 35, 36, 37, 39]},
     "B": {"label": "Problèmes cognitifs / Inattention", "items": [13, 14, 15, 16, 17, 18, 19, 20, 21, 22]},
@@ -166,82 +253,29 @@ SCALES: Dict[str, Dict[str, Any]] = {
     "E": {"label": "Perfectionnisme", "items": [24, 27, 31, 33]},
     "F": {"label": "Problèmes sociaux", "items": [48, 49, 50, 51, 52]},
     "G": {"label": "Symptômes psychosomatiques", "items": [70, 71, 72, 73]},
-    "H": {"label": "Index Conners – Global", "items": [1, 2, 6, 11, 13, 14, 15, 16, 17, 18]},
+    "H": {"label": "Index global", "items": [1, 2, 6, 11, 13, 14, 15, 16, 17, 18]},
     "I": {"label": "DSM-IV: Inattention", "items": [13, 14, 15, 16, 17, 18, 19, 20, 21]},
     "J": {"label": "DSM-IV: Hyperactivité/Impulsivité", "items": [2, 8, 24, 25, 26, 27, 28, 29, 30]},
     "K": {"label": "DSM-IV: Troubles des conduites", "items": [53, 54, 55, 56, 57, 58, 59]},
     "L": {"label": "DSM-IV: Opposition", "items": [3, 9, 10, 35, 36, 37, 39]},
-    "M": {"label": "Autres éléments (sociaux/émotionnels)", "items": [40, 41, 42, 43, 44, 45, 46]},
+    "M": {"label": "Éléments émotionnels", "items": [40, 41, 42, 43, 44, 45, 46]},
     "N": {"label": "Indice élargi (clinique)", "items": [1, 2, 6, 7, 8, 11, 12, 13, 14, 15]},
 }
 
-# -------------------------
-# OUTILS
-# -------------------------
-def normalize_name(s: str) -> str:
-    s = s.strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def generate_code(payload: dict) -> str:
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    h = hashlib.sha256(raw + str(time.time()).encode("utf-8")).hexdigest()
-    return h[:8].upper()
-
-def save_passation(code: str, payload: dict) -> str:
-    path = os.path.join(DATA_DIR, f"{code}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    return path
-
-def load_passation(code: str) -> dict:
-    path = os.path.join(DATA_DIR, f"{code}.json")
-    if not os.path.exists(path):
-        raise FileNotFoundError("Code introuvable.")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def send_email_with_code(code: str, who: str, child: str, age: str) -> Tuple[bool, str]:
-    if not (EMAIL_SENDER and EMAIL_APP_PASSWORD and PRACTITIONER_EMAIL):
-        return False, "Email non configuré (secrets manquants)."
-
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = f"Conners Parents – Code de récupération: {code}"
-        msg["From"] = EMAIL_SENDER
-        msg["To"] = PRACTITIONER_EMAIL
-        msg.set_content(
-            f"Une passation Conners Parents a été complétée.\n\n"
-            f"Code de récupération: {code}\n"
-            f"Répondant: {who}\n"
-            f"Enfant: {child}\n"
-            f"Âge: {age}\n"
-            f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        )
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(EMAIL_SENDER, EMAIL_APP_PASSWORD)
-            smtp.send_message(msg)
-
-        return True, "Email envoyé au praticien."
-    except Exception as e:
-        return False, f"Erreur email: {e}"
-
 def compute_scores(responses: Dict[int, int]) -> Dict[str, Any]:
-    # Total / moyenne
     vals = [responses.get(i, 0) for i in range(1, 81)]
     total = sum(vals)
     mean = total / 80.0
 
-    # Sous-échelles
     scale_scores = {}
     for key, meta in SCALES.items():
         items = meta["items"]
+        s = sum(responses.get(i, 0) for i in items)
         scale_scores[key] = {
             "label": meta["label"],
-            "sum": sum(responses.get(i, 0) for i in items),
+            "sum": s,
             "n_items": len(items),
-            "mean": (sum(responses.get(i, 0) for i in items) / len(items)) if items else 0.0,
+            "mean": (s / len(items)) if items else 0.0,
             "items": items,
         }
 
@@ -251,18 +285,11 @@ def compute_scores(responses: Dict[int, int]) -> Dict[str, Any]:
         "scales": scale_scores,
     }
 
-def practitioner_gate_ok() -> bool:
-    # Si aucun code praticien configuré, accès libre à l’espace praticien.
-    if not PRACTITIONER_ACCESS_CODE:
-        return True
-    st.info("Accès praticien protégé.")
-    code = st.text_input("Code praticien", type="password")
-    return code.strip() == PRACTITIONER_ACCESS_CODE.strip()
-
-# -------------------------
+# ============================================================
 # UI
-# -------------------------
+# ============================================================
 st.title(APP_TITLE)
+st.info(INSTRUCTION_ADULTE)
 st.caption(DISCLAIMER)
 st.markdown("---")
 
@@ -279,7 +306,7 @@ with tabs[0]:
     with col2:
         child_name = st.text_input("Prénom de l’enfant", value="")
     with col3:
-        child_age = st.text_input("Âge de l’enfant", value="")
+        child_age = st.text_input("Âge de l’enfant (laisser vide si adulte)", value="")
 
     respondent_name = normalize_name(respondent_name)
     child_name = normalize_name(child_name)
@@ -289,7 +316,6 @@ with tabs[0]:
 
     responses: Dict[int, int] = {}
 
-    # Affichage en deux colonnes pour confort
     left, right = st.columns(2)
     for i in range(1, 81):
         target = left if i <= 40 else right
@@ -304,7 +330,6 @@ with tabs[0]:
 
     st.markdown("---")
     if st.button("✅ Valider et générer le code", type="primary"):
-        # Sécurité minimale
         if not respondent_name or not child_name:
             st.error("Merci de renseigner au minimum le nom du répondant et le prénom de l’enfant.")
         else:
@@ -315,26 +340,25 @@ with tabs[0]:
                     "child_name": child_name,
                     "child_age": child_age,
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "questionnaire": "Conners Parents 80 items",
+                    "questionnaire": APP_TITLE,
                     "version_app": "1.0",
                 },
                 "responses": responses,
                 "scores": scores,
             }
+
             code = generate_code(payload)
             save_passation(code, payload)
 
             st.success(f"Passation enregistrée. Code de récupération : **{code}**")
             st.info("Conservez ce code. Il permettra au praticien de récupérer les résultats dans l’espace praticien.")
 
-            # Envoi email optionnel
             ok, msg = send_email_with_code(code, respondent_name, child_name, child_age)
             if ok:
                 st.success(msg)
             else:
                 st.warning(msg)
 
-            # Affichage synthétique (sans “rapport complet” si tu préfères)
             with st.expander("Voir un résumé des scores (pour vérification)", expanded=False):
                 st.write(f"Score total: **{scores['total_sum']}** / 240")
                 st.write(f"Score moyen: **{scores['total_mean']:.2f}** / 3")
@@ -357,7 +381,7 @@ with tabs[1]:
                 data = load_passation(code)
                 meta = data.get("meta", {})
                 scores = data.get("scores", {})
-                responses = data.get("responses", {})
+                resp = data.get("responses", {})
 
                 st.success("Passation chargée.")
 
@@ -381,16 +405,11 @@ with tabs[1]:
                     )
 
                 st.markdown("### Réponses (tableau)")
-                # Construit une table simple
                 rows = []
                 for i in range(1, 81):
-                    rows.append(
-                        {
-                            "Item": i,
-                            "Texte": ITEMS[i],
-                            "Réponse": int(responses.get(str(i), responses.get(i, 0))),
-                        }
-                    )
+                    # JSON peut contenir les clés en str selon sérialisation
+                    v = resp.get(str(i), resp.get(i, 0))
+                    rows.append({"Item": i, "Texte": ITEMS[i], "Réponse": int(v)})
                 st.dataframe(rows, use_container_width=True, hide_index=True)
 
                 st.markdown("### Export JSON")
@@ -398,7 +417,7 @@ with tabs[1]:
                 st.download_button(
                     label="⬇️ Télécharger le JSON",
                     data=json_str.encode("utf-8"),
-                    file_name=f"conners_parents_{code}.json",
+                    file_name=f"tdah_parents_{code}.json",
                     mime="application/json",
                 )
 
@@ -406,4 +425,4 @@ with tabs[1]:
                 st.error(f"Impossible de charger la passation : {e}")
 
 st.markdown("---")
-st.caption("© Outil de passation – usage professionnel. Les scores calculés suivent le mapping fourni dans le fichier Excel.")
+st.caption("© Outil de passation – usage professionnel. Les scores calculés suivent le mapping configuré dans l’application.")
