@@ -342,7 +342,7 @@ with tabs[0]:
             st.success("Merci pour votre participation.")
             st.info(f"Code de récupération à transmettre au praticien : **{code}**")
 
-            ok, msg = send_email_with_code(code, respondent_name, child_name, child_age)
+            ok, msg = send_email_with_code(code, payload)
             if ok:
                 st.success(msg)
             else:
