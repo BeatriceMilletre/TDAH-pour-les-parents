@@ -109,40 +109,41 @@ def load_passation(code: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def send_email_with_code(code: str, who: str, child: str, age: str) -> Tuple[bool, str]:
-    # si secrets non fournis, on n’échoue pas l’app : on informe seulement
+def send_email_with_code(code: str, payload: dict) -> Tuple[bool, str]:
     if not (EMAIL_HOST and EMAIL_PORT and EMAIL_USERNAME and EMAIL_PASSWORD and PRACTITIONER_EMAIL):
         return False, "Email non configuré."
 
     try:
         msg = EmailMessage()
-        msg["Subject"] = f"Évaluation TDAH – Code de récupération: {code}"
+        msg["Subject"] = f"Évaluation TDAH – Nouvelle passation ({code})"
         msg["From"] = EMAIL_USERNAME
         msg["To"] = PRACTITIONER_EMAIL
+
         msg.set_content(
-            "Une passation 'Évaluation des signes d'appel du TDAH par les parents' a été complétée.\n\n"
-            f"Code de récupération: {code}\n"
-            f"Répondant: {who}\n"
-            f"Enfant: {child}\n"
-            f"Âge (si renseigné): {age}\n"
-            f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            "Une nouvelle passation 'Évaluation des signes d’appel du TDAH par les parents' a été complétée.\n\n"
+            f"Code : {code}\n\n"
+            "Les réponses complètes sont jointes en pièce jointe (JSON).\n"
+        )
+
+        # ➜ pièce jointe JSON
+        json_bytes = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        msg.add_attachment(
+            json_bytes,
+            maintype="application",
+            subtype="json",
+            filename=f"tdah_parents_{code}.json",
         )
 
         smtp = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=20)
-        try:
+        smtp.ehlo()
+        if EMAIL_USE_TLS:
+            smtp.starttls()
             smtp.ehlo()
-            if EMAIL_USE_TLS:
-                smtp.starttls()
-                smtp.ehlo()
-            smtp.login(EMAIL_USERNAME, EMAIL_PASSWORD)
-            smtp.send_message(msg)
-        finally:
-            try:
-                smtp.quit()
-            except Exception:
-                pass
+        smtp.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+        smtp.send_message(msg)
+        smtp.quit()
 
-        return True, "Email envoyé au praticien."
+        return True, "Résultats envoyés au praticien par email."
     except Exception as e:
         return False, f"Erreur email: {e}"
 
